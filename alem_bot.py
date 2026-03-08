@@ -8,7 +8,8 @@ import os
 import json
 import logging
 import requests
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -179,27 +180,108 @@ async def cmd_overdue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
 
 
+def parse_date_from_text(text):
+    """Извлекает дату из текста. Возвращает datetime или None."""
+    today = datetime.now()
+    text_lower = text.lower()
+
+    # Сегодня / завтра / послезавтра
+    if any(w in text_lower for w in ['сегодня', 'today']):
+        return today
+    if any(w in text_lower for w in ['завтра', 'tomorrow']):
+        return today + timedelta(days=1)
+    if 'послезавтра' in text_lower:
+        return today + timedelta(days=2)
+
+    # Дни недели
+    days_ru = {'понедельник': 0, 'вторник': 1, 'среда': 2, 'среду': 2,
+               'четверг': 3, 'пятница': 4, 'пятницу': 4, 'суббота': 5,
+               'субботу': 5, 'воскресенье': 6}
+    for day_name, day_num in days_ru.items():
+        if day_name in text_lower:
+            diff = (day_num - today.weekday()) % 7
+            if diff == 0:
+                diff = 7
+            return today + timedelta(days=diff)
+
+    # Форматы: "9 марта", "09.03", "09.03.2026", "2026-03-09"
+    months_ru = {'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4,
+                 'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8,
+                 'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12}
+
+    # "9 марта" или "9 марта 2026"
+    for month_name, month_num in months_ru.items():
+        pattern = rf'(\d{{1,2}})\s+{month_name}(?:\s+(\d{{4}}))?'
+        m = re.search(pattern, text_lower)
+        if m:
+            day = int(m.group(1))
+            year = int(m.group(2)) if m.group(2) else today.year
+            try:
+                return datetime(year, month_num, day)
+            except:
+                pass
+
+    # "09.03.2026" или "09.03"
+    m = re.search(r'(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?', text)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else today.year
+        try:
+            return datetime(year, month, day)
+        except:
+            pass
+
+    # "2026-03-09"
+    m = re.search(r'(\d{4})-(\d{2})-(\d{2})', text)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except:
+            pass
+
+    return None
+
+
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not check_access(update.effective_user.id):
         return
-    await update.message.reply_text("⏳ Загружаю задачи на сегодня...")
-    today = datetime.now().strftime('%Y-%m-%d')
+    await tasks_for_date(update, datetime.now(), "сегодня")
+
+
+async def tasks_for_date(update, target_date, label):
+    """Показывает задачи с дедлайном на конкретную дату."""
+    date_str = target_date.strftime('%d.%m.%Y')
+    await update.message.reply_text(f"⏳ Загружаю задачи на {date_str}...")
+
+    date_start = target_date.strftime('%Y-%m-%dT00:00:00')
+    date_end = target_date.strftime('%Y-%m-%dT23:59:59')
+
     result = b24('tasks.task.list', {
-        'filter': {'!STATUS': [3, 6, 7], '<=DEADLINE': today + 'T23:59:59'},
-        'select': ['ID', 'TITLE', 'STATUS', 'PRIORITY', 'DEADLINE'],
+        'filter': {
+            '!STATUS': [3, 6, 7],
+            '>=DEADLINE': date_start,
+            '<=DEADLINE': date_end,
+        },
+        'select': ['ID', 'TITLE', 'STATUS', 'PRIORITY', 'DEADLINE', 'GROUP_ID'],
         'order': {'PRIORITY': 'DESC'},
-        'params': {'PAGING': {'PAGE_SIZE': 30}}
+        'params': {'PAGING': {'PAGE_SIZE': 50}}
     })
     tasks = result.get('tasks', []) if result else []
+
     if not tasks:
-        await update.message.reply_text("✅ На сегодня задач с дедлайном нет.")
+        await update.message.reply_text(
+            f"✅ На {date_str} задач с дедлайном нет.\n\n"
+            f"Хотите посмотреть *все активные задачи*? Напишите /tasks",
+            parse_mode='Markdown'
+        )
         return
 
-    lines = [f"📅 *Задачи на сегодня ({len(tasks)}):*\n"]
+    lines = [f"📅 *Задачи на {date_str} ({len(tasks)}):*\n"]
     for t in tasks:
-        overdue = '🔴 ' if is_overdue(t.get('deadline')) else '🟡 '
+        overdue = '🔴 ' if is_overdue(t.get('deadline')) else ''
         prio = PRIORITY_MAP.get(t.get('priority', '1'), '')
-        lines.append(f"{overdue}*{t['title']}*\n  {prio} | #{t['id']}\n")
+        status = STATUS_MAP.get(t.get('status', '1'), '—')
+        lines.append(f"{overdue}*{t['title']}*\n  {status} | {prio} | #{t['id']}\n")
 
     await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
 
@@ -329,8 +411,15 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_overdue(update, ctx)
         return
 
+    # Дата в тексте — «задачи на 9 марта», «на завтра», «на пятницу»
+    if any(w in text for w in ['на ', 'задачи ']):
+        target_date = parse_date_from_text(text)
+        if target_date:
+            await tasks_for_date(update, target_date, target_date.strftime('%d.%m.%Y'))
+            return
+
     # Сегодня
-    if any(w in text for w in ['сегодня', 'today', 'на день']):
+    if any(w in text for w in ['сегодня', 'today']):
         await cmd_today(update, ctx)
         return
 
